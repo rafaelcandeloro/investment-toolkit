@@ -47,16 +47,6 @@ ETF_UNIVERSE = {
         "EWJ",   # Japan
         "FXI",   # China large cap
     ],
-    "Fixed Income": [
-        "BND",   # Total bond market
-        "AGG",   # iShares core US aggregate bond
-        "TLT",   # 20+ year Treasury
-        "IEF",   # 7-10 year Treasury
-        "SHY",   # 1-3 year Treasury
-        "HYG",   # High yield corporate bonds
-        "LQD",   # Investment grade corporate bonds
-        "VTIP",  # Inflation-protected (TIPS)
-    ],
     "Real Assets": [
         "VNQ",   # Real estate (REITs)
         "GLD",   # Gold
@@ -78,11 +68,11 @@ ETF_UNIVERSE = {
 # Risk profile pools — which ETFs are eligible per risk level
 RISK_PROFILES = {
     "Conservative": [
-        "BND","AGG","TLT","IEF","SHY","LQD","VTIP","HYG",  # bonds
         "GLD","IAU","VNQ",                                   # real assets
-        "VTV","VONV","IWD","SCHV",                           # value
-        "XLP","XLU","XLV",                                   # defensive sectors
-        "VOO","VTI","ITOT",                                  # broad market anchor
+        "VTV","VONV","IWD","SCHV","VOOV",                   # value
+        "XLP","XLU","XLV","XLF",                            # defensive sectors
+        "VOO","VTI","ITOT","IWB",                           # broad market anchor
+        "EFA","VEA",                                         # international developed
     ],
     "Moderate": [
         "VOO","VTI","VOOG","IWM","ITOT","SCHB",             # broad market
@@ -90,8 +80,7 @@ RISK_PROFILES = {
         "QQQ","QQQM",                                        # growth (limited)
         "XLF","XLI","XLC","XLV","XLE",                      # sectors
         "EFA","VEA","IEMG",                                  # international
-        "BND","AGG","VTIP",                                  # bond anchor
-        "GLD",                                               # hedge
+        "GLD",                                               # real asset hedge
     ],
     "Aggressive": [
         "QQQ","QQQM","VGT","XLK","SOXX","SMH","IGV","ARKK", # growth & tech
