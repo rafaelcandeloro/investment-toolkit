@@ -90,7 +90,7 @@ def compute_metrics(prices_df: pd.DataFrame) -> pd.DataFrame:
     df["r_mom"]  = df["momentum"].rank(pct=True)
     df["r_vol"]  = df["vol"].rank(ascending=False, pct=True)
     df["r_dd"]   = df["drawdown"].rank(ascending=False, pct=True)
-    df["score"]  = df["r_ret"]*0.25 + df["r_shrp"]*0.35 + df["r_mom"]*0.20 + df["r_vol"]*0.10 + df["r_dd"]*0.10
+    df["score"]  = df["r_ret"]*0.15 + df["r_shrp"]*0.50 + df["r_mom"]*0.20 + df["r_vol"]*0.10 + df["r_dd"]*0.05
     return df.sort_values("score", ascending=False).reset_index(drop=True)
 
 
