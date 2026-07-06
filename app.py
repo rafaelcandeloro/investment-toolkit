@@ -39,12 +39,18 @@ def init_db():
         key TEXT PRIMARY KEY, value TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS paper_holdings (
         ticker TEXT PRIMARY KEY, shares REAL, avg_cost REAL, added_date DATE)""")
-    db.execute("""CREATE TABLE IF NOT EXISTS paper_snapshots (
-        snap_date DATE, portfolio_value REAL, spy_value REAL,
-        PRIMARY KEY (snap_date))""")
     db.execute("""CREATE TABLE IF NOT EXISTS monthly_log (
         log_date DATE, ticker TEXT, dollars REAL, shares REAL,
         PRIMARY KEY (log_date, ticker))""")
+    # Recreate paper_snapshots with correct schema if columns differ
+    existing_cols = [r[0] for r in db.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='paper_snapshots'"
+    ).fetchall()] if "paper_snapshots" in [r[0] for r in db.execute("SHOW TABLES").fetchall()] else []
+    if "portfolio_value" not in existing_cols:
+        db.execute("DROP TABLE IF EXISTS paper_snapshots")
+        db.execute("""CREATE TABLE paper_snapshots (
+            snap_date DATE, portfolio_value REAL, spy_value REAL,
+            PRIMARY KEY (snap_date))""")
     db.close()
 
 init_db()
