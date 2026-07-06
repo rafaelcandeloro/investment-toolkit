@@ -527,8 +527,10 @@ with tabs[2]:
 
     # Risk vs return chart
     st.subheader("Risk vs Return")
-    fig = px.scatter(metrics, x="vol", y="ret_1y", color="category",
-                     hover_name="ticker", size="sharpe",
+    scatter_df = metrics.copy()
+    scatter_df["bubble_size"] = scatter_df["sharpe"].clip(lower=0.1)
+    fig = px.scatter(scatter_df, x="vol", y="ret_1y", color="category",
+                     hover_name="ticker", size="bubble_size",
                      labels={"vol":"Volatility %","ret_1y":"1Y Return %"},
                      color_discrete_sequence=px.colors.qualitative.Pastel)
     in_port = target["ticker"].tolist()
