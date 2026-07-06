@@ -128,23 +128,28 @@ def build_allocation(tickers: list, prices_df: pd.DataFrame, portfolio_size: flo
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["inv_vol"] = 1 / df["vol"].replace(0, np.nan)
-    df["weight"]  = df["inv_vol"] / df["inv_vol"].sum()
-    df["alloc"]   = (df["weight"] * portfolio_size).round(2)
-    df["shares"]  = (df["alloc"] / df["price"]).apply(np.floor).astype(int)
-    df["value"]   = (df["shares"] * df["price"]).round(2)
+    df["inv_vol"]       = 1 / df["vol"].replace(0, np.nan)
+    df["weight"]        = df["inv_vol"] / df["inv_vol"].sum()
+    df["alloc"]         = (df["weight"] * portfolio_size).round(2)
+    # fractional shares — Robinhood supports these; show 4 decimal places for small portfolios
+    df["shares"]        = (df["alloc"] / df["price"]).round(4)
+    df["whole_shares"]  = df["shares"].apply(np.floor).astype(int)
+    df["value"]         = (df["shares"] * df["price"]).round(2)
     return df
 
 
-def portfolio_stats(allocation: pd.DataFrame, metrics: pd.DataFrame) -> dict:
-    merged = allocation.merge(metrics[["ticker","ret_1y","sharpe","drawdown","category"]], on="ticker", how="left")
+def portfolio_stats(allocation: pd.DataFrame) -> dict:
+    """allocation must already have ret_1y, sharpe, drawdown columns merged in."""
+    if allocation.empty:
+        return {"avg_return": 0, "avg_sharpe": 0, "avg_drawdown": 0,
+                "largest_pos": "—", "largest_wt": 0, "total_value": 0}
     return {
-        "avg_return":   round(merged["ret_1y"].mean(), 1),
-        "avg_sharpe":   round(merged["sharpe"].mean(), 2),
-        "avg_drawdown": round(merged["drawdown"].mean(), 1),
-        "largest_pos":  merged.loc[merged["weight"].idxmax(), "ticker"],
-        "largest_wt":   round(merged["weight"].max() * 100, 1),
-        "total_value":  merged["value"].sum(),
+        "avg_return":   round(allocation["ret_1y"].mean(skipna=True), 1),
+        "avg_sharpe":   round(allocation["sharpe"].mean(skipna=True), 2),
+        "avg_drawdown": round(allocation["drawdown"].mean(skipna=True), 1),
+        "largest_pos":  allocation.loc[allocation["weight"].idxmax(), "ticker"],
+        "largest_wt":   round(allocation["weight"].max() * 100, 1),
+        "total_value":  allocation["value"].sum(),
     }
 
 
@@ -221,7 +226,11 @@ with st.sidebar:
     st.caption("AI-directed portfolio construction")
     st.divider()
 
-    portfolio_size = st.number_input("Portfolio size ($)", value=100_000, step=5_000, format="%d")
+    st.markdown("**Your Portfolio**")
+    portfolio_size = st.number_input("Total amount to invest ($)", value=600, step=100, min_value=100, format="%d")
+    monthly_contribution = st.number_input("Monthly contribution ($)", value=600, step=50, min_value=0, format="%d")
+    if monthly_contribution > 0:
+        st.caption(f"At ${monthly_contribution}/mo → ${monthly_contribution*12:,}/yr → ${monthly_contribution*12*5:,} in 5 years (excl. returns)")
 
     st.divider()
     if st.button("🔄 Refresh market data", use_container_width=True):
@@ -346,9 +355,7 @@ with tabs[0]:
         if alloc.empty:
             col.warning(f"{name}: no data")
             continue
-        s = portfolio_stats(alloc, compute_metrics(prices if name == "ETF Strategy" else
-                            (hf_prices if name == "Hedge Fund Mirror" else
-                             pd.concat([prices, hf_prices], ignore_index=True))))
+        s = portfolio_stats(alloc)
         col.markdown(f"### {name}")
         col.metric("Avg 1Y Return",  f"{s['avg_return']:+.1f}%")
         col.metric("Avg Sharpe",     f"{s['avg_sharpe']:.2f}")
@@ -416,16 +423,19 @@ with tabs[1]:
     # Holdings table
     st.subheader("Holdings")
     disp = etf_alloc[["ticker","category","wt_pct","alloc","shares","price","ret_1y","sharpe","drawdown","momentum"]].copy()
-    disp.columns = ["Ticker","Category","Weight %","Alloc $","Shares","Price","1Y Ret %","Sharpe","Max DD %","Momentum %"]
+    disp.columns = ["Ticker","Category","Weight %","Alloc $","Shares (fractional)","Price","1Y Ret %","Sharpe","Max DD %","Momentum %"]
     st.dataframe(
         disp.style
-            .format({"Alloc $": "${:,.0f}", "Price": "${:.2f}",
+            .format({"Alloc $": "${:,.2f}", "Price": "${:.2f}",
+                     "Shares (fractional)": "{:.4f}",
                      "Weight %": "{:.1f}%", "1Y Ret %": "{:+.1f}%",
                      "Max DD %": "{:+.1f}%", "Momentum %": "{:+.2f}%"})
             .background_gradient(subset=["Sharpe"], cmap="Greens")
             .background_gradient(subset=["1Y Ret %"], cmap="Blues"),
         use_container_width=True, hide_index=True
     )
+    if portfolio_size < 1000:
+        st.caption("💡 Robinhood supports fractional shares — you can invest exact dollar amounts without needing whole shares.")
 
     # Full screener
     st.subheader("Full ETF Universe — Screener")
