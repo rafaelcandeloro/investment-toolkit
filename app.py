@@ -1,70 +1,93 @@
-import os
-import subprocess
-import sys
-from datetime import date, timedelta
+import os, subprocess, sys
+from datetime import date
 
-import duckdb
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
-import yfinance as yf
+import duckdb, numpy as np, pandas as pd
+import plotly.express as px, plotly.graph_objects as go
+import streamlit as st, yfinance as yf
 
-from hf_13f import FUNDS, fetch_fund_holdings, get_aggregate_holdings
-from universe import ETF_UNIVERSE, TICKERS
+from universe import ETF_UNIVERSE, RISK_PROFILES, TICKERS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-DB              = "portfolio.duckdb"
-RISK_FREE       = 0.045
-CORR_THRESHOLD  = 0.80
-ETF_SLOTS       = 15
-HF_SLOTS        = 20
-MIXED_ETF       = 8
-MIXED_HF        = 12
+DB             = "portfolio.duckdb"
+RISK_FREE      = 0.045
+CORR_THRESHOLD = 0.80
+SLOTS          = {"Conservative": 6, "Moderate": 8, "Aggressive": 7}
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="Investment Toolkit",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Investment Toolkit", page_icon="📈",
+                   layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
 [data-testid="stSidebar"] { background-color: #0f0f1a; }
-.metric-label { font-size: 0.8rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
-.metric-value { font-size: 1.6rem; font-weight: 700; }
-.pos { color: #4ade80; } .neg { color: #f87171; } .neu { color: #94a3b8; }
-div[data-testid="stTabs"] button { font-size: 0.85rem; }
-</style>
-""", unsafe_allow_html=True)
+.big-number { font-size: 2.2rem; font-weight: 700; }
+.label { font-size: 0.78rem; color: #888; text-transform: uppercase; letter-spacing:.05em; }
+</style>""", unsafe_allow_html=True)
 
 
-# ── Data helpers ──────────────────────────────────────────────────────────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def get_db(read_only=False):
+    return duckdb.connect(DB, read_only=read_only)
+
+
+def init_db():
+    db = get_db()
+    db.execute("""CREATE TABLE IF NOT EXISTS user_profile (
+        key TEXT PRIMARY KEY, value TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS paper_holdings (
+        ticker TEXT PRIMARY KEY, shares REAL, avg_cost REAL, added_date DATE)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS paper_snapshots (
+        snap_date DATE, portfolio_value REAL, spy_value REAL,
+        PRIMARY KEY (snap_date))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS monthly_log (
+        log_date DATE, ticker TEXT, dollars REAL, shares REAL,
+        PRIMARY KEY (log_date, ticker))""")
+    db.close()
+
+init_db()
+
+
+def get_profile():
+    db = get_db(read_only=True)
+    rows = db.execute("SELECT key, value FROM user_profile").fetchall()
+    db.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def save_profile(risk: str, monthly: float):
+    db = get_db()
+    db.execute("INSERT OR REPLACE INTO user_profile VALUES ('risk', ?)", [risk])
+    db.execute("INSERT OR REPLACE INTO user_profile VALUES ('monthly', ?)", [str(monthly)])
+    db.close()
+
+
+# ── Data loading ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_prices(tickers=None):
-    db = duckdb.connect(DB, read_only=True)
-    if tickers:
-        placeholders = ",".join(f"'{t}'" for t in tickers)
-        df = db.execute(f"SELECT * FROM prices WHERE ticker IN ({placeholders}) ORDER BY ticker, Date").fetchdf()
-    else:
-        df = db.execute("SELECT * FROM prices ORDER BY ticker, Date").fetchdf()
+def load_prices():
+    db = get_db(read_only=True)
+    df = db.execute("SELECT * FROM prices ORDER BY ticker, Date").fetchdf()
     db.close()
     return df
 
 
-def compute_metrics(prices_df: pd.DataFrame) -> pd.DataFrame:
+def latest_price(prices_df, ticker):
+    sub = prices_df[prices_df["ticker"] == ticker]
+    return float(sub["Close"].iloc[-1]) if not sub.empty else None
+
+
+# ── Core finance functions ────────────────────────────────────────────────────
+
+def compute_metrics(prices_df: pd.DataFrame, tickers: list) -> pd.DataFrame:
     rows = []
-    for ticker, grp in prices_df.groupby("ticker"):
-        grp = grp.sort_values("Date").reset_index(drop=True)
+    for ticker in tickers:
+        grp = prices_df[prices_df["ticker"] == ticker].sort_values("Date").reset_index(drop=True)
         if len(grp) < 50:
             continue
-        c = grp["Close"]
+        c      = grp["Close"]
         ret_1y = (c.iloc[-1] - c.iloc[0]) / c.iloc[0]
         ret_3m = (c.iloc[-1] - c.iloc[-63]) / c.iloc[-63] if len(grp) >= 63 else np.nan
         ret_6m = (c.iloc[-1] - c.iloc[-126]) / c.iloc[-126] if len(grp) >= 126 else np.nan
@@ -73,42 +96,37 @@ def compute_metrics(prices_df: pd.DataFrame) -> pd.DataFrame:
         sharpe = (ret_1y - RISK_FREE) / vol if vol > 0 else 0
         dd     = ((c - c.cummax()) / c.cummax()).min()
         mom    = (ret_3m - ret_6m) if not (np.isnan(ret_3m) or np.isnan(ret_6m)) else 0
-        cat    = next((k for k, v in ETF_UNIVERSE.items() if ticker in v), "Stock")
-        rows.append(dict(
-            ticker=ticker, category=cat,
-            ret_1y=round(ret_1y * 100, 1),
-            ret_3m=round(ret_3m * 100, 1) if not np.isnan(ret_3m) else None,
-            vol=round(vol * 100, 1),
-            sharpe=round(sharpe, 2),
-            drawdown=round(dd * 100, 1),
-            momentum=round(mom * 100, 2),
-            price=round(c.iloc[-1], 2),
-        ))
+        cat    = next((k for k, v in ETF_UNIVERSE.items() if ticker in v), "Other")
+        rows.append(dict(ticker=ticker, category=cat,
+                         ret_1y=round(ret_1y*100,1), vol=round(vol*100,1),
+                         sharpe=round(sharpe,2), drawdown=round(dd*100,1),
+                         momentum=round(mom*100,2), price=round(c.iloc[-1],2)))
     df = pd.DataFrame(rows)
+    if df.empty:
+        return df
     df["r_ret"]  = df["ret_1y"].rank(pct=True)
     df["r_shrp"] = df["sharpe"].rank(pct=True)
     df["r_mom"]  = df["momentum"].rank(pct=True)
     df["r_vol"]  = df["vol"].rank(ascending=False, pct=True)
     df["r_dd"]   = df["drawdown"].rank(ascending=False, pct=True)
-    df["score"]  = df["r_ret"]*0.15 + df["r_shrp"]*0.50 + df["r_mom"]*0.20 + df["r_vol"]*0.10 + df["r_dd"]*0.05
+    df["score"]  = (df["r_ret"]*0.15 + df["r_shrp"]*0.50 +
+                    df["r_mom"]*0.20 + df["r_vol"]*0.10 + df["r_dd"]*0.05)
     return df.sort_values("score", ascending=False).reset_index(drop=True)
 
 
-def filter_correlated(ranked_tickers: list, prices_df: pd.DataFrame, threshold=CORR_THRESHOLD):
-    """Remove tickers that correlate > threshold with a higher-ranked ticker already kept."""
-    pivot = (
-        prices_df[prices_df["ticker"].isin(ranked_tickers)]
-        .pivot(index="Date", columns="ticker", values="Close")
-        .pct_change().dropna()
-    )
+def filter_correlated(ranked_tickers, prices_df, threshold=CORR_THRESHOLD):
+    avail = [t for t in ranked_tickers if t in prices_df["ticker"].values]
+    if len(avail) < 2:
+        return avail, {}
+    pivot = (prices_df[prices_df["ticker"].isin(avail)]
+             .pivot(index="Date", columns="ticker", values="Close")
+             .pct_change().dropna())
     kept, dropped = [], {}
-    for t in ranked_tickers:
+    for t in avail:
         if t not in pivot.columns:
             continue
-        conflict = next(
-            (k for k in kept if k in pivot.columns and pivot[t].corr(pivot[k]) > threshold),
-            None
-        )
+        conflict = next((k for k in kept if k in pivot.columns
+                         and pivot[t].corr(pivot[k]) > threshold), None)
         if conflict:
             dropped[t] = (conflict, round(pivot[t].corr(pivot[conflict]), 2))
         else:
@@ -116,660 +134,549 @@ def filter_correlated(ranked_tickers: list, prices_df: pd.DataFrame, threshold=C
     return kept, dropped
 
 
-def build_allocation(tickers: list, prices_df: pd.DataFrame, portfolio_size: float) -> pd.DataFrame:
+def build_target_allocation(tickers, prices_df, n_slots):
     rows = []
-    for t in tickers:
+    for t in tickers[:n_slots*3]:  # screen wider, filter down
         grp = prices_df[prices_df["ticker"] == t].sort_values("Date")
         if grp.empty:
             continue
         c   = grp["Close"]
         vol = c.pct_change().dropna().std() * np.sqrt(252)
         rows.append({"ticker": t, "vol": vol, "price": round(c.iloc[-1], 2)})
+        if len(rows) >= n_slots:
+            break
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["inv_vol"]       = 1 / df["vol"].replace(0, np.nan)
-    df["weight"]        = df["inv_vol"] / df["inv_vol"].sum()
-    df["alloc"]         = (df["weight"] * portfolio_size).round(2)
-    # fractional shares — Robinhood supports these; show 4 decimal places for small portfolios
-    df["shares"]        = (df["alloc"] / df["price"]).round(4)
-    df["whole_shares"]  = df["shares"].apply(np.floor).astype(int)
-    df["value"]         = (df["shares"] * df["price"]).round(2)
-    return df
+    df["inv_vol"] = 1 / df["vol"].replace(0, np.nan)
+    df["weight"]  = df["inv_vol"] / df["inv_vol"].sum()
+    return df[["ticker","weight","price","vol"]]
 
 
-def portfolio_stats(allocation: pd.DataFrame) -> dict:
-    """allocation must already have ret_1y, sharpe, drawdown columns merged in."""
-    if allocation.empty:
-        return {"avg_return": 0, "avg_sharpe": 0, "avg_drawdown": 0,
-                "largest_pos": "—", "largest_wt": 0, "total_value": 0}
-    return {
-        "avg_return":   round(allocation["ret_1y"].mean(skipna=True), 1),
-        "avg_sharpe":   round(allocation["sharpe"].mean(skipna=True), 2),
-        "avg_drawdown": round(allocation["drawdown"].mean(skipna=True), 1),
-        "largest_pos":  allocation.loc[allocation["weight"].idxmax(), "ticker"],
-        "largest_wt":   round(allocation["weight"].max() * 100, 1),
-        "total_value":  allocation["value"].sum(),
-    }
+def monthly_buy_plan(target: pd.DataFrame, holdings: pd.DataFrame,
+                     monthly_budget: float, prices_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given target weights, current holdings, and this month's budget,
+    return how much to buy of each ETF to drift back toward target.
+    """
+    latest = prices_df.sort_values("Date").groupby("ticker")["Close"].last().to_dict()
+
+    plan = target.copy()
+    plan["current_price"] = plan["ticker"].map(lambda t: latest.get(t, plan.loc[plan["ticker"]==t,"price"].values[0]))
+
+    # Merge in current holdings
+    if not holdings.empty:
+        plan = plan.merge(holdings[["ticker","shares"]], on="ticker", how="left")
+    else:
+        plan["shares"] = 0.0
+
+    plan["shares"]        = plan["shares"].fillna(0)
+    plan["current_value"] = plan["shares"] * plan["current_price"]
+    total_current         = plan["current_value"].sum()
+    total_projected       = total_current + monthly_budget
+
+    plan["target_value"]  = plan["weight"] * total_projected
+    plan["underweight"]   = (plan["target_value"] - plan["current_value"]).clip(lower=0)
+
+    total_uw = plan["underweight"].sum()
+    if total_uw > 0:
+        plan["buy_dollars"] = (plan["underweight"] / total_uw * monthly_budget).round(2)
+    else:
+        plan["buy_dollars"] = (plan["weight"] * monthly_budget).round(2)
+
+    plan["buy_shares"]    = (plan["buy_dollars"] / plan["current_price"]).round(4)
+    plan["current_pct"]   = (plan["current_value"] / total_current * 100).round(1) if total_current > 0 else 0
+    plan["target_pct"]    = (plan["weight"] * 100).round(1)
+    plan["drift_pct"]     = (plan["current_pct"] - plan["target_pct"]).round(1)
+
+    return plan
 
 
-# ── Paper trading ─────────────────────────────────────────────────────────────
+# ── Load data ─────────────────────────────────────────────────────────────────
 
-def init_paper_trading(portfolios: dict, prices_df: pd.DataFrame):
-    """Record starting positions if no paper trade exists yet."""
-    db = duckdb.connect(DB)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS paper_start (
-            portfolio TEXT, ticker TEXT, shares INTEGER,
-            start_price REAL, start_date DATE,
-            PRIMARY KEY (portfolio, ticker)
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS paper_snapshots (
-            snap_date DATE, portfolio TEXT, value REAL,
-            PRIMARY KEY (snap_date, portfolio)
-        )
-    """)
+try:
+    prices = load_prices()
+except Exception:
+    st.error("No market data found. Click **Refresh Data** in the sidebar.")
+    st.stop()
 
-    existing = db.execute("SELECT DISTINCT portfolio FROM paper_start").fetchdf()
-    started  = set(existing["portfolio"].tolist()) if not existing.empty else set()
-
-    today = date.today().isoformat()
-    for name, alloc in portfolios.items():
-        if name in started or alloc.empty:
-            continue
-        for _, row in alloc.iterrows():
-            grp = prices_df[prices_df["ticker"] == row["ticker"]].sort_values("Date")
-            if grp.empty:
-                continue
-            db.execute(
-                "INSERT OR IGNORE INTO paper_start VALUES (?,?,?,?,?)",
-                [name, row["ticker"], int(row["shares"]), float(grp["Close"].iloc[-1]), today]
-            )
-    db.close()
-
-
-def record_paper_snapshot(portfolios: dict, prices_df: pd.DataFrame):
-    db   = duckdb.connect(DB)
-    today = date.today().isoformat()
-    for name, alloc in portfolios.items():
-        if alloc.empty:
-            continue
-        total = 0.0
-        for _, row in alloc.iterrows():
-            grp = prices_df[prices_df["ticker"] == row["ticker"]].sort_values("Date")
-            if not grp.empty:
-                total += int(row["shares"]) * float(grp["Close"].iloc[-1])
-        db.execute(
-            "INSERT OR REPLACE INTO paper_snapshots VALUES (?,?,?)",
-            [today, name, round(total, 2)]
-        )
-    db.close()
-
-
-def load_paper_history() -> pd.DataFrame:
-    db  = duckdb.connect(DB, read_only=True)
-    tables = [r[0] for r in db.execute("SHOW TABLES").fetchall()]
-    if "paper_snapshots" not in tables:
-        db.close()
-        return pd.DataFrame()
-    df = db.execute("SELECT * FROM paper_snapshots ORDER BY snap_date").fetchdf()
-    db.close()
-    return df
+profile = get_profile()
+risk    = profile.get("risk", None)
+monthly = float(profile.get("monthly", 600))
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("## 📈 Investment Toolkit")
-    st.caption("AI-directed portfolio construction")
     st.divider()
 
-    st.markdown("**Your Portfolio**")
-    portfolio_size = st.number_input("Total amount to invest ($)", value=600, step=100, min_value=100, format="%d")
-    monthly_contribution = st.number_input("Monthly contribution ($)", value=600, step=50, min_value=0, format="%d")
-    if monthly_contribution > 0:
-        st.caption(f"At ${monthly_contribution}/mo → ${monthly_contribution*12:,}/yr → ${monthly_contribution*12*5:,} in 5 years (excl. returns)")
+    if risk:
+        badge = {"Conservative": "🟢", "Moderate": "🟡", "Aggressive": "🔴"}
+        st.markdown(f"**Profile:** {badge.get(risk,'')} {risk}")
+        st.markdown(f"**Monthly:** ${monthly:,.0f}")
+        if st.button("Change profile", use_container_width=True):
+            st.session_state["setup"] = True
+    else:
+        st.session_state["setup"] = True
 
     st.divider()
+
     if st.button("🔄 Refresh market data", use_container_width=True):
-        with st.spinner("Fetching latest prices..."):
+        with st.spinner("Fetching latest prices…"):
             subprocess.run([sys.executable, "fetch.py"])
         st.cache_data.clear()
         st.rerun()
 
     st.divider()
-    st.markdown("**AI Analyst API Key**")
-    api_key_input = st.text_input("Anthropic API key", type="password",
-                                  value=os.environ.get("ANTHROPIC_API_KEY", ""),
-                                  placeholder="sk-ant-...")
-    if api_key_input:
-        os.environ["ANTHROPIC_API_KEY"] = api_key_input
+    st.markdown("**AI Analyst (optional)**")
+    api_key = st.text_input("Anthropic API key", type="password",
+                            value=os.environ.get("ANTHROPIC_API_KEY",""),
+                            placeholder="sk-ant-…")
+    if api_key:
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+
+    st.divider()
+    st.markdown("**Robinhood (optional)**")
+    rh_user = st.text_input("Username/email", key="rh_user")
+    rh_pass = st.text_input("Password", type="password", key="rh_pass")
+    if st.button("Connect Robinhood", use_container_width=True):
+        try:
+            import robin_stocks.robinhood as rh
+            rh.login(rh_user, rh_pass)
+            st.session_state["rh_connected"] = True
+            st.success("Connected!")
+        except Exception as e:
+            st.error(f"Login failed: {e}")
 
     st.divider()
     st.caption("Data: Yahoo Finance · SEC EDGAR")
-    st.caption(f"Risk-free rate: {RISK_FREE*100:.1f}% (T-bill)")
-    st.caption(f"Correlation filter: >{CORR_THRESHOLD}")
 
 
-# ── Load ETF data ─────────────────────────────────────────────────────────────
+# ── Setup wizard ──────────────────────────────────────────────────────────────
 
-try:
-    prices = load_prices()
-except Exception:
-    st.error("No data found. Click **Refresh market data** in the sidebar.")
+if st.session_state.get("setup") or not risk:
+    st.title("Welcome — Let's set up your profile")
+    st.markdown("Answer two questions. You can change these anytime.")
+    st.divider()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### What's your risk tolerance?")
+        st.caption("This determines which ETFs we pick for you.")
+        new_risk = st.radio("", [
+            "Conservative — protect my money, slow growth",
+            "Moderate — balanced growth and stability",
+            "Aggressive — maximum growth, I can handle big swings",
+        ], label_visibility="collapsed")
+        new_risk = new_risk.split(" — ")[0]
+
+    with col2:
+        st.markdown("#### How much will you invest monthly?")
+        st.caption("The app tells you exactly how to split this each month.")
+        new_monthly = st.number_input("Monthly contribution ($)",
+                                      value=600, min_value=50, step=50, format="%d")
+
+    st.divider()
+    if st.button("Save and continue →", type="primary"):
+        save_profile(new_risk, new_monthly)
+        st.session_state["setup"] = False
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
 
-etf_metrics  = compute_metrics(prices)
-ranked_etfs  = etf_metrics["ticker"].tolist()
-kept_etfs, dropped_etfs = filter_correlated(ranked_etfs, prices)
-etf_alloc    = build_allocation(kept_etfs[:ETF_SLOTS], prices, portfolio_size)
-etf_alloc    = etf_alloc.merge(
-    etf_metrics[["ticker","ret_1y","sharpe","drawdown","momentum","category"]],
-    on="ticker", how="left"
-)
+
+# ── Build portfolio for this risk profile ─────────────────────────────────────
+
+eligible   = RISK_PROFILES[risk]
+metrics    = compute_metrics(prices, eligible)
+n_slots    = SLOTS[risk]
+ranked     = metrics["ticker"].tolist()
+kept, dropped_map = filter_correlated(ranked, prices)
+target     = build_target_allocation(kept, prices, n_slots)
+target     = target.merge(metrics[["ticker","ret_1y","sharpe","drawdown","momentum","category"]],
+                          on="ticker", how="left")
+target["weight_pct"] = (target["weight"] * 100).round(1)
+
+# Load paper holdings
+db = get_db(read_only=True)
+tables = [r[0] for r in db.execute("SHOW TABLES").fetchall()]
+holdings_df = db.execute("SELECT * FROM paper_holdings").fetchdf() if "paper_holdings" in tables else pd.DataFrame()
+db.close()
 
 
-# ── Load HF data ──────────────────────────────────────────────────────────────
+# ── Robinhood holdings override ───────────────────────────────────────────────
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def build_hf_portfolio(portfolio_size):
-    agg = get_aggregate_holdings()
-    if agg.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    hf_tickers = agg["ticker"].head(40).tolist()
-
-    # Fetch price data for HF stocks
-    hf_prices_list = []
-    for t in hf_tickers:
-        try:
-            df = yf.download(t, period="1y", progress=False, auto_adjust=True)
-            if df.empty:
-                continue
-            df = df.reset_index()
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            df["ticker"] = t
-            hf_prices_list.append(df[["Date", "ticker", "Close"]])
-        except Exception:
-            continue
-
-    if not hf_prices_list:
-        return pd.DataFrame(), pd.DataFrame()
-
-    hf_prices = pd.concat(hf_prices_list, ignore_index=True)
-    hf_metrics = compute_metrics(hf_prices)
-    ranked_hf = hf_metrics["ticker"].tolist()
-    kept_hf, _ = filter_correlated(ranked_hf, hf_prices)
-    alloc = build_allocation(kept_hf[:HF_SLOTS], hf_prices, portfolio_size)
-    alloc = alloc.merge(
-        hf_metrics[["ticker","ret_1y","sharpe","drawdown","momentum"]].assign(category="Stock"),
-        on="ticker", how="left"
-    )
-    alloc = alloc.merge(agg[["ticker","funds","fund_count"]], on="ticker", how="left")
-    return alloc, hf_prices
+if st.session_state.get("rh_connected"):
+    try:
+        import robin_stocks.robinhood as rh
+        positions = rh.get_open_stock_positions()
+        rh_rows = []
+        for p in positions:
+            ticker = rh.get_symbol_by_url(p["instrument"])
+            rh_rows.append({"ticker": ticker,
+                            "shares": float(p["quantity"]),
+                            "avg_cost": float(p["average_buy_price"])})
+        if rh_rows:
+            holdings_df = pd.DataFrame(rh_rows)
+    except Exception:
+        pass
 
 
-# ── Build mixed portfolio ─────────────────────────────────────────────────────
+# ── Plan ──────────────────────────────────────────────────────────────────────
 
-def build_mixed(etf_alloc, hf_alloc, prices_df, hf_prices_df, portfolio_size):
-    if etf_alloc.empty or hf_alloc.empty:
-        return pd.DataFrame()
-    etf_picks = etf_alloc["ticker"].head(MIXED_ETF).tolist()
-    hf_picks  = hf_alloc["ticker"].head(MIXED_HF).tolist()
-    combined  = etf_picks + hf_picks
-    all_prices = pd.concat([prices_df, hf_prices_df], ignore_index=True)
-    all_prices = all_prices.drop_duplicates(subset=["Date","ticker"])
-    kept, _ = filter_correlated(combined, all_prices)
-    alloc = build_allocation(kept, all_prices, portfolio_size)
-    etf_meta = etf_alloc[["ticker","ret_1y","sharpe","drawdown","momentum","category"]]
-    hf_meta  = hf_alloc[["ticker","ret_1y","sharpe","drawdown","momentum","category"]]
-    meta = pd.concat([etf_meta, hf_meta]).drop_duplicates("ticker")
-    return alloc.merge(meta, on="ticker", how="left")
+plan = monthly_buy_plan(target, holdings_df, monthly, prices)
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tabs = st.tabs(["Dashboard", "ETF Portfolio", "Hedge Fund Portfolio",
-                "Mixed Portfolio", "Paper Trader", "AI Analyst"])
+tabs = st.tabs(["📅 This Month", "📊 My Portfolio", "🔍 ETF Screener",
+                "📈 Paper Trader", "🤖 AI Analyst"])
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 1 — DASHBOARD
+# TAB 1 — THIS MONTH
 # ════════════════════════════════════════════════════════════════════════════════
 
 with tabs[0]:
-    st.title("Portfolio Dashboard")
+    rh_note = " · Live from Robinhood" if st.session_state.get("rh_connected") else " · Paper portfolio"
+    st.title(f"This Month's Investment Plan")
+    st.caption(f"{risk} profile · ${monthly:,.0f}/month{rh_note}")
 
-    with st.spinner("Loading hedge fund data…"):
-        hf_alloc, hf_prices = build_hf_portfolio(portfolio_size)
+    total_current = plan["current_value"].sum()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Portfolio value today", f"${total_current:,.2f}")
+    c2.metric("Adding this month",     f"${monthly:,.0f}")
+    c3.metric("After contribution",    f"${total_current + monthly:,.2f}")
 
-    mixed_alloc = build_mixed(etf_alloc, hf_alloc, prices, hf_prices, portfolio_size)
+    st.divider()
+    st.subheader(f"Buy this month with ${monthly:,.0f}:")
 
-    # Top metrics
-    cols = st.columns(3)
-    for col, name, alloc in zip(cols,
-            ["ETF Strategy", "Hedge Fund Mirror", "Mixed Strategy"],
-            [etf_alloc, hf_alloc, mixed_alloc]):
-        if alloc.empty:
-            col.warning(f"{name}: no data")
+    for _, row in plan.iterrows():
+        if row["buy_dollars"] < 0.01:
             continue
-        s = portfolio_stats(alloc)
-        col.markdown(f"### {name}")
-        col.metric("Avg 1Y Return",  f"{s['avg_return']:+.1f}%")
-        col.metric("Avg Sharpe",     f"{s['avg_sharpe']:.2f}")
-        col.metric("Avg Drawdown",   f"{s['avg_drawdown']:+.1f}%")
-        col.metric("Largest position", f"{s['largest_pos']} ({s['largest_wt']:.1f}%)")
+        drift_str = f"underweight {abs(row['drift_pct']):.1f}%" if row["drift_pct"] < -0.5 else \
+                    f"overweight {row['drift_pct']:.1f}%" if row["drift_pct"] > 0.5 else "on target"
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 3])
+        col1.markdown(f"### {row['ticker']}")
+        col2.markdown(f"**${row['buy_dollars']:,.2f}**")
+        col3.markdown(f"**{row['buy_shares']:.4f} shares**")
+        col4.caption(f"Target {row['target_pct']:.1f}% · Currently {row['current_pct']:.1f}% · {drift_str}")
 
     st.divider()
 
-    # Side-by-side allocation pies
-    st.subheader("Allocation Breakdown")
-    pie_cols = st.columns(3)
-    for col, name, alloc in zip(pie_cols,
-            ["ETF Strategy", "Hedge Fund Mirror", "Mixed Strategy"],
-            [etf_alloc, hf_alloc, mixed_alloc]):
-        if alloc.empty:
-            col.info("No data")
-            continue
-        alloc["wt_pct"] = (alloc["weight"] * 100).round(1)
-        fig = px.pie(alloc, values="wt_pct", names="ticker", hole=0.45,
-                     color_discrete_sequence=px.colors.qualitative.Pastel, title=name)
+    col_mark, col_rh = st.columns(2)
+    with col_mark:
+        if st.button("✅ Mark as invested (paper)", use_container_width=True, type="primary"):
+            db = get_db()
+            today = date.today().isoformat()
+            for _, row in plan.iterrows():
+                if row["buy_dollars"] < 0.01:
+                    continue
+                existing = db.execute("SELECT shares, avg_cost FROM paper_holdings WHERE ticker=?",
+                                      [row["ticker"]]).fetchone()
+                if existing:
+                    old_shares, old_cost = existing
+                    new_shares = old_shares + row["buy_shares"]
+                    new_cost   = (old_shares*old_cost + row["buy_shares"]*row["current_price"]) / new_shares
+                    db.execute("UPDATE paper_holdings SET shares=?, avg_cost=?, added_date=? WHERE ticker=?",
+                               [new_shares, new_cost, today, row["ticker"]])
+                else:
+                    db.execute("INSERT INTO paper_holdings VALUES (?,?,?,?)",
+                               [row["ticker"], row["buy_shares"], row["current_price"], today])
+                db.execute("INSERT OR REPLACE INTO monthly_log VALUES (?,?,?,?)",
+                           [today, row["ticker"], row["buy_dollars"], row["buy_shares"]])
+            db.close()
+            st.success("Recorded! Your paper portfolio has been updated.")
+            st.rerun()
+
+    with col_rh:
+        if st.session_state.get("rh_connected"):
+            if st.button("🤖 Execute on Robinhood", use_container_width=True):
+                try:
+                    import robin_stocks.robinhood as rh
+                    for _, row in plan.iterrows():
+                        if row["buy_dollars"] < 1:
+                            continue
+                        rh.order_buy_fractional_by_price(row["ticker"],
+                                                         row["buy_dollars"],
+                                                         timeInForce="gfd")
+                    st.success("Orders placed on Robinhood!")
+                except Exception as e:
+                    st.error(f"Order failed: {e}")
+        else:
+            st.button("🤖 Execute on Robinhood (connect first)", disabled=True, use_container_width=True)
+
+    # Allocation breakdown
+    st.divider()
+    st.subheader("Target allocation")
+    col_pie, col_tbl = st.columns([1, 1])
+
+    with col_pie:
+        fig = px.pie(target, values="weight_pct", names="ticker", hole=0.45,
+                     color_discrete_sequence=px.colors.qualitative.Pastel)
         fig.update_traces(textposition="inside", textinfo="percent+label")
-        fig.update_layout(showlegend=False, margin=dict(t=40,b=0,l=0,r=0), height=300)
-        col.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0), height=300)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_tbl:
+        tbl = target[["ticker","category","weight_pct","ret_1y","sharpe","drawdown"]].copy()
+        tbl.columns = ["Ticker","Category","Target %","1Y Ret %","Sharpe","Max DD %"]
+        st.dataframe(
+            tbl.style
+               .format({"Target %":"{:.1f}%","1Y Ret %":"{:+.1f}%","Max DD %":"{:+.1f}%"})
+               .background_gradient(subset=["Sharpe"], cmap="Greens"),
+            hide_index=True, use_container_width=True
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — ETF PORTFOLIO
+# TAB 2 — MY PORTFOLIO
 # ════════════════════════════════════════════════════════════════════════════════
 
 with tabs[1]:
-    st.title("ETF Portfolio")
-    st.caption(f"58-ETF universe → correlation filtered (>{int(CORR_THRESHOLD*100)}%) → top {ETF_SLOTS} → inverse-volatility weighted")
+    st.title("My Portfolio")
 
-    if dropped_etfs:
-        with st.expander(f"🔀 {len(dropped_etfs)} ETFs removed by correlation filter"):
-            for t, (conflict, corr) in dropped_etfs.items():
-                st.caption(f"{t} removed — corr {corr} with {conflict} (already held)")
+    if holdings_df.empty:
+        st.info("No holdings yet. Go to **This Month** and click **Mark as invested** after your first contribution.")
+    else:
+        # Enrich holdings with current prices and metrics
+        hld = holdings_df.copy()
+        hld["current_price"] = hld["ticker"].map(lambda t: latest_price(prices, t))
+        hld["current_value"] = hld["shares"] * hld["current_price"]
+        hld["cost_basis"]    = hld["shares"] * hld["avg_cost"]
+        hld["gain_loss"]     = hld["current_value"] - hld["cost_basis"]
+        hld["gain_pct"]      = (hld["gain_loss"] / hld["cost_basis"] * 100).round(2)
+        hld = hld.merge(target[["ticker","weight_pct","category"]], on="ticker", how="left")
 
-    # Summary metrics
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Positions",        len(etf_alloc))
-    c2.metric("Avg 1Y Return",    f"{etf_alloc['ret_1y'].mean():+.1f}%")
-    c3.metric("Avg Sharpe",       f"{etf_alloc['sharpe'].mean():.2f}")
-    c4.metric("Avg Max Drawdown", f"{etf_alloc['drawdown'].mean():+.1f}%")
+        total_val   = hld["current_value"].sum()
+        total_cost  = hld["cost_basis"].sum()
+        total_gain  = total_val - total_cost
+        total_gain_pct = total_gain / total_cost * 100 if total_cost > 0 else 0
 
-    st.divider()
-    left, right = st.columns([1,1])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Portfolio Value", f"${total_val:,.2f}")
+        c2.metric("Total Cost Basis", f"${total_cost:,.2f}")
+        g_delta = f"{total_gain_pct:+.1f}%"
+        c3.metric("Total Gain / Loss", f"${total_gain:+,.2f}", delta=g_delta)
+        c4.metric("Positions", len(hld))
 
-    with left:
-        etf_alloc["wt_pct"] = (etf_alloc["weight"] * 100).round(1)
-        fig_pie = px.pie(etf_alloc, values="wt_pct", names="ticker", hole=0.4,
+        st.divider()
+
+        col_l, col_r = st.columns([1, 1])
+        with col_l:
+            hld["pct_of_port"] = (hld["current_value"] / total_val * 100).round(1)
+            fig = px.pie(hld, values="pct_of_port", names="ticker", hole=0.45,
                          color_discrete_sequence=px.colors.qualitative.Pastel)
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0), height=350)
-        st.plotly_chart(fig_pie, use_container_width=True)
+            fig.update_traces(textposition="inside", textinfo="percent+label")
+            fig.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0), height=300)
+            st.plotly_chart(fig, use_container_width=True)
 
-    with right:
-        cat_df = etf_alloc.groupby("category")["wt_pct"].sum().reset_index()
-        fig_bar = px.bar(cat_df.sort_values("wt_pct"), x="wt_pct", y="category",
-                         orientation="h", color="wt_pct", color_continuous_scale="Blues",
-                         labels={"wt_pct": "Weight %", "category": ""})
-        fig_bar.update_layout(coloraxis_showscale=False, margin=dict(t=0,b=0,l=0,r=0), height=350)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        with col_r:
+            disp = hld[["ticker","shares","avg_cost","current_price","current_value","gain_loss","gain_pct"]].copy()
+            disp.columns = ["Ticker","Shares","Avg Cost","Price","Value","Gain $","Gain %"]
+            st.dataframe(
+                disp.style
+                    .format({"Shares":"{:.4f}","Avg Cost":"${:.2f}","Price":"${:.2f}",
+                             "Value":"${:,.2f}","Gain $":"${:+,.2f}","Gain %":"{:+.2f}%"})
+                    .applymap(lambda v: "color:#4ade80" if isinstance(v,str) and v.startswith("$+")
+                              else ("color:#f87171" if isinstance(v,str) and v.startswith("$-") else ""),
+                              subset=["Gain $"]),
+                hide_index=True, use_container_width=True
+            )
 
-    # Holdings table
-    st.subheader("Holdings")
-    disp = etf_alloc[["ticker","category","wt_pct","alloc","shares","price","ret_1y","sharpe","drawdown","momentum"]].copy()
-    disp.columns = ["Ticker","Category","Weight %","Alloc $","Shares (fractional)","Price","1Y Ret %","Sharpe","Max DD %","Momentum %"]
-    st.dataframe(
-        disp.style
-            .format({"Alloc $": "${:,.2f}", "Price": "${:.2f}",
-                     "Shares (fractional)": "{:.4f}",
-                     "Weight %": "{:.1f}%", "1Y Ret %": "{:+.1f}%",
-                     "Max DD %": "{:+.1f}%", "Momentum %": "{:+.2f}%"})
-            .background_gradient(subset=["Sharpe"], cmap="Greens")
-            .background_gradient(subset=["1Y Ret %"], cmap="Blues"),
-        use_container_width=True, hide_index=True
-    )
-    if portfolio_size < 1000:
-        st.caption("💡 Robinhood supports fractional shares — you can invest exact dollar amounts without needing whole shares.")
+        # Drift vs target
+        st.subheader("Drift from target allocation")
+        drift_df = plan[plan["current_value"] > 0][["ticker","target_pct","current_pct","drift_pct"]].copy()
+        drift_df.columns = ["Ticker","Target %","Current %","Drift %"]
+        fig_drift = px.bar(drift_df, x="Ticker", y="Drift %",
+                           color="Drift %", color_continuous_scale="RdYlGn",
+                           color_continuous_midpoint=0)
+        fig_drift.add_hline(y=0, line_dash="dash", line_color="white")
+        fig_drift.update_layout(height=300, coloraxis_showscale=False)
+        st.plotly_chart(fig_drift, use_container_width=True)
+        st.caption("Negative = underweight (buy more). Positive = overweight (let it drift or trim).")
 
-    # Full screener
-    st.subheader("Full ETF Universe — Screener")
-    cat_filter = st.selectbox("Filter category",
-                              ["All"] + sorted(etf_metrics["category"].unique()), key="cat_etf")
-    view = etf_metrics if cat_filter == "All" else etf_metrics[etf_metrics["category"] == cat_filter]
-    view = view[["ticker","category","ret_1y","sharpe","vol","drawdown","momentum","price"]].copy()
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 3 — ETF SCREENER
+# ════════════════════════════════════════════════════════════════════════════════
+
+with tabs[2]:
+    st.title("ETF Screener")
+    st.caption(f"Showing ETFs eligible for your **{risk}** profile — scored 50% Sharpe, 20% momentum, 15% return")
+
+    if dropped_map:
+        with st.expander(f"{len(dropped_map)} ETFs removed by correlation filter (>{int(CORR_THRESHOLD*100)}%)"):
+            for t, (conflict, corr) in dropped_map.items():
+                st.caption(f"{t} removed — {corr:.2f} correlation with {conflict}")
+
+    view = metrics[["ticker","category","ret_1y","sharpe","vol","drawdown","momentum","price"]].copy()
     view.columns = ["Ticker","Category","1Y Ret %","Sharpe","Vol %","Max DD %","Momentum %","Price"]
-    view.insert(0, "Rank", range(1, len(view)+1))
+    view.insert(0,"Rank", range(1, len(view)+1))
+    view["In portfolio"] = view["Ticker"].isin(target["ticker"].tolist()).map({True:"✅", False:""})
+
     st.dataframe(
         view.style
-            .format({"1Y Ret %": "{:+.1f}%", "Sharpe": "{:.2f}", "Vol %": "{:.1f}%",
-                     "Max DD %": "{:+.1f}%", "Momentum %": "{:+.2f}%", "Price": "${:.2f}"})
+            .format({"1Y Ret %":"{:+.1f}%","Sharpe":"{:.2f}",
+                     "Vol %":"{:.1f}%","Max DD %":"{:+.1f}%",
+                     "Momentum %":"{:+.2f}%","Price":"${:.2f}"})
             .background_gradient(subset=["Sharpe"], cmap="Greens"),
-        use_container_width=True, hide_index=True, height=500
+        use_container_width=True, hide_index=True, height=550
     )
 
+    # Risk vs return chart
+    st.subheader("Risk vs Return")
+    fig = px.scatter(metrics, x="vol", y="ret_1y", color="category",
+                     hover_name="ticker", size="sharpe",
+                     labels={"vol":"Volatility %","ret_1y":"1Y Return %"},
+                     color_discrete_sequence=px.colors.qualitative.Pastel)
+    in_port = target["ticker"].tolist()
+    port_pts = metrics[metrics["ticker"].isin(in_port)]
+    fig.add_scatter(x=port_pts["vol"], y=port_pts["ret_1y"],
+                    mode="markers+text", text=port_pts["ticker"],
+                    textposition="top center",
+                    marker=dict(size=14, color="white", line=dict(color="black",width=2)),
+                    name="In your portfolio")
+    fig.update_layout(height=450)
+    st.plotly_chart(fig, use_container_width=True)
+
     # Correlation heatmap for selected portfolio
-    st.subheader("Correlation Matrix — ETF Portfolio")
-    st.caption("Values above 0.80 are blocked by the filter. This shows what remains.")
-    pivot  = prices[prices["ticker"].isin(etf_alloc["ticker"])].pivot(
-        index="Date", columns="ticker", values="Close").pct_change().dropna()
-    corr   = pivot.corr().round(2)
+    st.subheader("Correlation Matrix — Your Portfolio")
+    held_tickers = target["ticker"].tolist()
+    pivot = (prices[prices["ticker"].isin(held_tickers)]
+             .pivot(index="Date", columns="ticker", values="Close")
+             .pct_change().dropna())
+    corr = pivot.corr().round(2)
     fig_hm = go.Figure(go.Heatmap(
         z=corr.values, x=corr.columns.tolist(), y=corr.index.tolist(),
         colorscale="RdBu_r", zmin=-1, zmax=1,
-        text=corr.values.round(2), texttemplate="%{text}", textfont={"size": 9},
-    ))
-    fig_hm.update_layout(height=500, margin=dict(t=20,b=0,l=0,r=0))
+        text=corr.values.round(2), texttemplate="%{text}", textfont={"size":10}))
+    fig_hm.update_layout(height=450, margin=dict(t=20,b=0,l=0,r=0))
     st.plotly_chart(fig_hm, use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — HEDGE FUND PORTFOLIO
-# ════════════════════════════════════════════════════════════════════════════════
-
-with tabs[2]:
-    st.title("Hedge Fund Mirror Portfolio")
-    st.caption("Built from SEC 13F filings — Citadel, Millennium, Two Sigma, D.E. Shaw, Point72")
-    st.info("⚠️ 13F filings are delayed 45 days and filed quarterly. These are disclosed positions, not current ones.", icon="ℹ️")
-
-    if hf_alloc.empty:
-        st.warning("Could not load 13F data from SEC EDGAR.")
-        st.info("SEC EDGAR rate-limits requests. This usually resolves in 1-2 minutes. Click **Refresh market data** in the sidebar or reload the page.")
-        if st.button("🔄 Retry hedge fund data"):
-            get_aggregate_holdings.clear()
-            build_hf_portfolio.clear()
-            st.rerun()
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Positions",        len(hf_alloc))
-        c2.metric("Avg 1Y Return",    f"{hf_alloc['ret_1y'].mean():+.1f}%")
-        c3.metric("Avg Sharpe",       f"{hf_alloc['sharpe'].mean():.2f}")
-        c4.metric("Avg Max Drawdown", f"{hf_alloc['drawdown'].mean():+.1f}%")
-
-        left, right = st.columns([1,1])
-        with left:
-            hf_alloc["wt_pct"] = (hf_alloc["weight"] * 100).round(1)
-            fig = px.pie(hf_alloc, values="wt_pct", names="ticker", hole=0.4,
-                         color_discrete_sequence=px.colors.qualitative.Set3)
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            fig.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0), height=350)
-            left.plotly_chart(fig, use_container_width=True)
-
-        with right:
-            st.subheader("Individual Fund Holdings")
-            fund_sel = st.selectbox("Select fund", list(FUNDS.keys()))
-            fund_df, filing_date = fetch_fund_holdings(fund_sel, FUNDS[fund_sel])
-            if not fund_df.empty:
-                st.caption(f"Latest filing: {filing_date}")
-                top25 = fund_df.sort_values("value_thousands", ascending=False).head(25)
-                top25["Value ($M)"]    = (top25["value_thousands"] / 1000).round(1)
-                top25["% of Filing"]   = (top25["value_thousands"] / top25["value_thousands"].sum() * 100).round(1)
-                st.dataframe(
-                    top25[["name","ticker","Value ($M)","% of Filing"]].style
-                        .format({"Value ($M)": "${:,.0f}M", "% of Filing": "{:.1f}%"})
-                        .background_gradient(subset=["% of Filing"], cmap="Blues"),
-                    hide_index=True, use_container_width=True, height=320
-                )
-
-        st.subheader("Mirror Portfolio Holdings")
-        hf_disp = hf_alloc[["ticker","wt_pct","alloc","shares","price","ret_1y","sharpe","drawdown","fund_count","funds"]].copy()
-        hf_disp.columns = ["Ticker","Weight %","Alloc $","Shares","Price","1Y Ret %","Sharpe","Max DD %","# Funds","Held By"]
-        st.dataframe(
-            hf_disp.style
-                .format({"Alloc $": "${:,.0f}", "Price": "${:.2f}",
-                         "Weight %": "{:.1f}%", "1Y Ret %": "{:+.1f}%", "Max DD %": "{:+.1f}%"})
-                .background_gradient(subset=["Sharpe"], cmap="Greens"),
-            use_container_width=True, hide_index=True
-        )
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 4 — MIXED PORTFOLIO
+# TAB 4 — PAPER TRADER
 # ════════════════════════════════════════════════════════════════════════════════
 
 with tabs[3]:
-    st.title("Mixed Strategy Portfolio")
-    st.caption(f"Top {MIXED_ETF} ETFs + top {MIXED_HF} hedge fund picks → correlation filtered → inverse-vol weighted")
-
-    if mixed_alloc.empty:
-        st.warning("Mixed portfolio requires hedge fund data. Try refreshing.")
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Positions",        len(mixed_alloc))
-        c2.metric("Avg 1Y Return",    f"{mixed_alloc['ret_1y'].mean():+.1f}%")
-        c3.metric("Avg Sharpe",       f"{mixed_alloc['sharpe'].mean():.2f}")
-        c4.metric("Avg Max Drawdown", f"{mixed_alloc['drawdown'].mean():+.1f}%")
-
-        mixed_alloc["wt_pct"] = (mixed_alloc["weight"] * 100).round(1)
-        left, right = st.columns([1,1])
-
-        with left:
-            fig = px.pie(mixed_alloc, values="wt_pct", names="ticker", hole=0.4,
-                         color_discrete_sequence=px.colors.qualitative.Vivid)
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            fig.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0), height=350)
-            st.plotly_chart(fig, use_container_width=True)
-
-        with right:
-            cat_df = mixed_alloc.groupby("category")["wt_pct"].sum().reset_index()
-            fig_bar = px.bar(cat_df.sort_values("wt_pct"), x="wt_pct", y="category",
-                             orientation="h", color="wt_pct", color_continuous_scale="Purples",
-                             labels={"wt_pct": "Weight %", "category": ""})
-            fig_bar.update_layout(coloraxis_showscale=False, margin=dict(t=0,b=0,l=0,r=0), height=350)
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        disp = mixed_alloc[["ticker","category","wt_pct","alloc","shares","price","ret_1y","sharpe","drawdown"]].copy()
-        disp.columns = ["Ticker","Type","Weight %","Alloc $","Shares","Price","1Y Ret %","Sharpe","Max DD %"]
-        st.dataframe(
-            disp.style
-                .format({"Alloc $": "${:,.0f}", "Price": "${:.2f}",
-                         "Weight %": "{:.1f}%", "1Y Ret %": "{:+.1f}%", "Max DD %": "{:+.1f}%"})
-                .background_gradient(subset=["Sharpe"], cmap="Greens"),
-            use_container_width=True, hide_index=True
-        )
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — PAPER TRADER
-# ════════════════════════════════════════════════════════════════════════════════
-
-with tabs[4]:
     st.title("Paper Trader")
-    st.caption("Tracks all three portfolios vs S&P 500. No real money. Pure performance simulation.")
+    st.caption("Tracks your portfolio value vs S&P 500 over time.")
 
-    port_map = {"ETF Strategy": etf_alloc, "Hedge Fund Mirror": hf_alloc, "Mixed Strategy": mixed_alloc}
-    all_prices_combined = pd.concat([prices, hf_prices], ignore_index=True).drop_duplicates(subset=["Date","ticker"])
+    if st.button("📸 Snapshot today's value", type="primary"):
+        if holdings_df.empty:
+            st.warning("No holdings yet to snapshot.")
+        else:
+            hld_snap = holdings_df.copy()
+            hld_snap["price"]  = hld_snap["ticker"].map(lambda t: latest_price(prices, t))
+            hld_snap["value"]  = hld_snap["shares"] * hld_snap["price"]
+            total = hld_snap["value"].sum()
 
-    if st.button("▶ Start / Update paper trading snapshot"):
-        init_paper_trading(port_map, all_prices_combined)
-        record_paper_snapshot(port_map, all_prices_combined)
-        st.success("Snapshot recorded.")
-        load_paper_history.clear() if hasattr(load_paper_history, "clear") else None
+            spy_price = latest_price(prices, "SPY")
+            if spy_price is None:
+                try:
+                    spy_df = yf.download("SPY", period="1d", progress=False, auto_adjust=True)
+                    spy_price = float(spy_df["Close"].iloc[-1])
+                except Exception:
+                    spy_price = 0
 
-    history = load_paper_history()
+            db = get_db()
+            db.execute("INSERT OR REPLACE INTO paper_snapshots VALUES (?,?,?)",
+                       [date.today().isoformat(), round(total,2), round(spy_price,2)])
+            db.close()
+            st.success(f"Snapshot saved: portfolio ${total:,.2f}")
 
-    if history.empty:
-        st.info("No paper trading history yet. Click **▶ Start / Update** above to begin tracking.")
+    db = get_db(read_only=True)
+    snap_df = db.execute("SELECT * FROM paper_snapshots ORDER BY snap_date").fetchdf() \
+              if "paper_snapshots" in [r[0] for r in db.execute("SHOW TABLES").fetchall()] \
+              else pd.DataFrame()
+    db.close()
+
+    if snap_df.empty:
+        st.info("No snapshots yet. Click above after you've invested your first month.")
     else:
+        snap_df["snap_date"] = pd.to_datetime(snap_df["snap_date"])
+        start_port = snap_df["portfolio_value"].iloc[0]
+        start_spy  = snap_df["spy_value"].iloc[0]
+
+        snap_df["port_indexed"] = (snap_df["portfolio_value"] / start_port * 100).round(2)
+        snap_df["spy_indexed"]  = (snap_df["spy_value"] / start_spy * 100).round(2) if start_spy > 0 else 100
+
         fig = go.Figure()
-        colors = {"ETF Strategy": "#60a5fa", "Hedge Fund Mirror": "#34d399", "Mixed Strategy": "#f472b6"}
-
-        for port_name in history["portfolio"].unique():
-            sub = history[history["portfolio"] == port_name].copy()
-            sub["snap_date"] = pd.to_datetime(sub["snap_date"])
-            if sub.empty or sub["value"].iloc[0] == 0:
-                continue
-            start_val = sub["value"].iloc[0]
-            sub["indexed"] = (sub["value"] / start_val) * 100
-            fig.add_trace(go.Scatter(
-                x=sub["snap_date"], y=sub["indexed"],
-                name=port_name, line=dict(width=2, color=colors.get(port_name, "white"))
-            ))
-
-        # SPY benchmark — only add if we have at least 2 snapshots
-        if len(history["snap_date"].unique()) >= 2:
-            try:
-                start_date = pd.to_datetime(history["snap_date"].min()).strftime("%Y-%m-%d")
-                spy_raw = yf.download("SPY", start=start_date, progress=False, auto_adjust=True)
-                if not spy_raw.empty:
-                    spy_raw = spy_raw.reset_index()
-                    spy_raw.columns = [c[0] if isinstance(c, tuple) else c for c in spy_raw.columns]
-                    start_spy = spy_raw["Close"].iloc[0]
-                    spy_raw["SPY"] = (spy_raw["Close"] / start_spy) * 100
-                    fig.add_trace(go.Scatter(
-                        x=pd.to_datetime(spy_raw["Date"]), y=spy_raw["SPY"],
-                        name="S&P 500 (SPY)", line=dict(width=2, dash="dash", color="#94a3b8")
-                    ))
-            except Exception:
-                pass
-
-        fig.update_layout(
-            title="Portfolio Performance vs S&P 500 (indexed to 100)",
-            yaxis_title="Value (indexed to 100)", xaxis_title="Date",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            height=450
-        )
+        fig.add_trace(go.Scatter(x=snap_df["snap_date"], y=snap_df["port_indexed"],
+                                 name=f"Your portfolio ({risk})",
+                                 line=dict(width=2, color="#60a5fa")))
+        fig.add_trace(go.Scatter(x=snap_df["snap_date"], y=snap_df["spy_indexed"],
+                                 name="S&P 500 (SPY)",
+                                 line=dict(width=2, dash="dash", color="#94a3b8")))
+        fig.update_layout(title="Performance vs S&P 500 (indexed to 100)",
+                          yaxis_title="Value (indexed to 100)",
+                          legend=dict(orientation="h", y=1.05), height=400)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Stats table
-        st.subheader("Performance Summary")
-        rows = []
-        for port_name in history["portfolio"].unique():
-            sub = history[history["portfolio"] == port_name]
-            start, end = sub["value"].iloc[0], sub["value"].iloc[-1]
-            rows.append({
-                "Portfolio": port_name,
-                "Start Value": f"${start:,.0f}",
-                "Current Value": f"${end:,.0f}",
-                "Return": f"{(end-start)/start*100:+.1f}%",
-                "Days Tracked": (pd.to_datetime(sub["snap_date"].max()) - pd.to_datetime(sub["snap_date"].min())).days
-            })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-        st.subheader("Adaptive Weighting Recommendation")
-        st.caption("After 90+ days, allocate more toward the top performer.")
-        days = (pd.to_datetime(history["snap_date"].max()) - pd.to_datetime(history["snap_date"].min())).days
-        if days < 90:
-            st.info(f"Need {90 - days} more days of data before adaptive weighting kicks in.")
-        else:
-            returns = {}
-            for port_name in history["portfolio"].unique():
-                sub = history[history["portfolio"] == port_name]
-                returns[port_name] = (sub["value"].iloc[-1] - sub["value"].iloc[0]) / sub["value"].iloc[0]
-            best = max(returns, key=returns.get)
-            st.success(f"**{best}** has the best return ({returns[best]*100:+.1f}%). Recommend increasing allocation to this strategy.")
+        days = (snap_df["snap_date"].max() - snap_df["snap_date"].min()).days
+        port_ret = (snap_df["portfolio_value"].iloc[-1] / start_port - 1) * 100
+        spy_ret  = (snap_df["spy_value"].iloc[-1] / start_spy - 1) * 100 if start_spy > 0 else 0
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Days tracked", days)
+        c2.metric("Your return", f"{port_ret:+.1f}%")
+        c3.metric("S&P 500 return", f"{spy_ret:+.1f}%",
+                  delta=f"{port_ret-spy_ret:+.1f}% vs market")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — AI ANALYST
+# TAB 5 — AI ANALYST
 # ════════════════════════════════════════════════════════════════════════════════
 
-def build_portfolio_context():
-    lines = ["You are a professional portfolio analyst. Here is the current portfolio data:\n"]
-    lines.append("## ETF PORTFOLIO")
-    if not etf_alloc.empty:
-        for _, r in etf_alloc.iterrows():
-            lines.append(f"- {r['ticker']} ({r.get('category','')}) — "
-                         f"weight {r['wt_pct']:.1f}%, 1Y return {r['ret_1y']:+.1f}%, "
-                         f"Sharpe {r['sharpe']:.2f}, max drawdown {r['drawdown']:+.1f}%")
-    if not hf_alloc.empty:
-        lines.append("\n## HEDGE FUND MIRROR PORTFOLIO")
-        for _, r in hf_alloc.iterrows():
-            lines.append(f"- {r['ticker']} — weight {r['wt_pct']:.1f}%, "
-                         f"1Y return {r['ret_1y']:+.1f}%, Sharpe {r['sharpe']:.2f}, "
-                         f"held by {r.get('fund_count','?')} fund(s)")
-    lines.append(f"\n## METHODOLOGY")
-    lines.append(f"- Weighting: inverse-volatility (lower vol = higher weight)")
-    lines.append(f"- Correlation filter: pairs above {CORR_THRESHOLD} are removed")
-    lines.append(f"- Risk-free rate: {RISK_FREE*100:.1f}% (T-bill)")
-    lines.append(f"- 13F filings are delayed 45 days — disclosed positions, not current")
-    lines.append("\nAnswer clearly and concisely. Use professional language, explain jargon.")
+def generate_quick_brief():
+    lines = [f"# Portfolio Morning Brief — {date.today().strftime('%B %d, %Y')}\n"]
+    lines.append(f"**Risk profile:** {risk}  |  **Monthly contribution:** ${monthly:,.0f}\n")
+
+    avg_sharpe = target["sharpe"].mean()
+    avg_ret    = target["ret_1y"].mean()
+    avg_dd     = target["drawdown"].mean()
+    best  = target.loc[target["ret_1y"].idxmax()]
+    worst = target.loc[target["ret_1y"].idxmin()]
+
+    lines.append("## Portfolio Metrics")
+    lines.append(f"- **Avg Sharpe:** {avg_sharpe:.2f} — "
+                 f"{'above' if avg_sharpe>=1 else 'below'} the 1.0 benchmark")
+    lines.append(f"- **Avg 1Y Return:** {avg_ret:+.1f}%")
+    lines.append(f"- **Avg Max Drawdown:** {avg_dd:+.1f}%")
+    lines.append(f"- **Best performer:** {best['ticker']} ({best['ret_1y']:+.1f}%, Sharpe {best['sharpe']:.2f})")
+    lines.append(f"- **Weakest performer:** {worst['ticker']} ({worst['ret_1y']:+.1f}%)\n")
+
+    lines.append("## Holdings")
+    for _, r in target.iterrows():
+        lines.append(f"- **{r['ticker']}** ({r['category']}) — "
+                     f"{r['weight_pct']:.1f}% weight, {r['ret_1y']:+.1f}% 1Y, Sharpe {r['sharpe']:.2f}")
+
+    lines.append("\n## This Month")
+    top_buy = plan.nlargest(3, "buy_dollars")
+    lines.append(f"Largest buys: " +
+                 ", ".join(f"{r['ticker']} (${r['buy_dollars']:.0f})" for _,r in top_buy.iterrows()))
+
+    lines.append("\n## Key Notes")
+    lines.append(f"- Correlation filter blocked pairs above {int(CORR_THRESHOLD*100)}% — holdings are genuinely diversified")
+    lines.append(f"- Risk-free rate: {RISK_FREE*100:.1f}% — Sharpe below 1.0 means insufficient risk compensation")
+    lines.append(f"- Inverse-volatility weighting: lower-vol ETFs receive higher allocations systematically")
     return "\n".join(lines)
 
 
-def generate_quick_brief() -> str:
-    """Template-based portfolio brief — no API key needed."""
-    from datetime import date as dt
-    lines = []
-    lines.append(f"# Portfolio Morning Brief — {dt.today().strftime('%B %d, %Y')}\n")
+with tabs[4]:
+    st.title("AI Analyst")
 
-    if not etf_alloc.empty:
-        avg_ret    = etf_alloc["ret_1y"].mean()
-        avg_sharpe = etf_alloc["sharpe"].mean()
-        avg_dd     = etf_alloc["drawdown"].mean()
-        best       = etf_alloc.loc[etf_alloc["ret_1y"].idxmax()]
-        worst      = etf_alloc.loc[etf_alloc["ret_1y"].idxmin()]
-        top3       = etf_alloc.nlargest(3, "weight")["ticker"].tolist()
-        cat_wts    = etf_alloc.groupby("category")["wt_pct"].sum().sort_values(ascending=False)
-
-        lines.append("## ETF Portfolio")
-        lines.append(f"**Avg 1Y Return:** {avg_ret:+.1f}%  |  "
-                     f"**Avg Sharpe:** {avg_sharpe:.2f}  |  "
-                     f"**Avg Max Drawdown:** {avg_dd:+.1f}%\n")
-        lines.append(f"**Largest positions:** {', '.join(top3)}")
-        lines.append(f"**Best performer:** {best['ticker']} ({best['ret_1y']:+.1f}%, Sharpe {best['sharpe']:.2f})")
-        lines.append(f"**Worst performer:** {worst['ticker']} ({worst['ret_1y']:+.1f}%)\n")
-        lines.append("**Category breakdown:**")
-        for cat, wt in cat_wts.items():
-            lines.append(f"- {cat}: {wt:.1f}%")
-
-        sharpe_note = ("above the 1.0 benchmark — solid risk-adjusted return"
-                       if avg_sharpe >= 1.0 else
-                       "below the 1.0 benchmark — consider higher-momentum names or reducing low-return positions")
-        lines.append(f"\n**Sharpe assessment:** {avg_sharpe:.2f} is {sharpe_note}.")
-
-        if avg_dd < -15:
-            lines.append(f"**Drawdown note:** Average max drawdown of {avg_dd:.1f}% is elevated. "
-                         "Review positions with the largest drops for thesis changes.")
-
-    if not hf_alloc.empty:
-        lines.append("\n## Hedge Fund Mirror Portfolio")
-        top_hf = hf_alloc.nlargest(5, "weight")
-        lines.append(f"**Top 5 positions:** {', '.join(top_hf['ticker'].tolist())}")
-        lines.append(f"**Avg 1Y Return:** {hf_alloc['ret_1y'].mean():+.1f}%  |  "
-                     f"**Avg Sharpe:** {hf_alloc['sharpe'].mean():.2f}")
-        multi_fund = hf_alloc[hf_alloc.get("fund_count", pd.Series([0]*len(hf_alloc))) >= 2]
-        if not multi_fund.empty:
-            lines.append(f"**High conviction (2+ funds):** {', '.join(multi_fund['ticker'].tolist())}")
-
-    lines.append("\n## Key Reminders")
-    lines.append(f"- Correlation filter blocked pairs above {int(CORR_THRESHOLD*100)}% — remaining holdings are genuinely diversified")
-    lines.append("- 13F filings lag reality by 45 days — hedge fund tab shows disclosed, not current, positions")
-    lines.append(f"- Risk-free rate: {RISK_FREE*100:.1f}% — any Sharpe below 1.0 means you're not being fully compensated for risk")
-
-    return "\n".join(lines)
-
-
-with tabs[5]:
-    st.title("AI Portfolio Analyst")
-
-    analyst_mode = st.radio(
-        "Mode",
-        ["Quick Brief (free, no API key)", "Claude AI Chat (requires API key)"],
-        horizontal=True
-    )
-
+    mode = st.radio("Mode", ["Quick Brief (free)", "Claude AI Chat (API key required)"], horizontal=True)
     st.divider()
 
-    if analyst_mode == "Quick Brief (free, no API key)":
-        st.caption("Generates a structured portfolio brief from your live data. No API key needed.")
+    if mode == "Quick Brief (free)":
         if st.button("Generate Morning Brief", type="primary"):
-            with st.spinner("Analyzing your portfolio..."):
-                brief = generate_quick_brief()
-            st.markdown(brief)
-            st.divider()
-            st.caption("For conversational Q&A and deeper analysis, switch to Claude AI Chat mode and add an API key.")
+            st.markdown(generate_quick_brief())
 
     else:
-        st.caption("Conversational analyst powered by Claude. Enter your Anthropic API key in the sidebar.")
         if not os.environ.get("ANTHROPIC_API_KEY"):
-            st.warning("Enter your Anthropic API key in the sidebar to enable AI chat.")
-            st.info("Get one at console.anthropic.com → API Keys. $5 in credits lasts months of personal use.")
+            st.warning("Enter your Anthropic API key in the sidebar.")
         else:
             try:
                 import anthropic
@@ -777,7 +684,11 @@ with tabs[5]:
                 st.error("Run: pip3 install anthropic")
                 st.stop()
 
-            system_prompt = build_portfolio_context()
+            system = (f"You are a professional portfolio analyst. The user has a {risk} risk profile, "
+                      f"invests ${monthly:,.0f}/month, and holds: " +
+                      ", ".join(f"{r['ticker']} ({r['weight_pct']:.1f}%)" for _,r in target.iterrows()) +
+                      f". Avg Sharpe: {target['sharpe'].mean():.2f}. "
+                      "Answer concisely and professionally.")
 
             if "messages" not in st.session_state:
                 st.session_state.messages = []
@@ -787,34 +698,26 @@ with tabs[5]:
                     st.markdown(msg["content"])
 
             if not st.session_state.messages:
-                st.markdown("**Try asking:**")
-                suggestions = [
-                    "Give me a morning brief on my ETF portfolio",
-                    "Which portfolio has the best risk-adjusted return and why?",
-                    "Are my portfolios actually diversified or just correlated bets?",
-                    "What macro factors should I be watching given these holdings?",
-                    "Explain inverse-volatility weighting in plain English",
-                ]
+                suggestions = ["Give me a morning brief", "Am I well diversified?",
+                               "What macro risks should I watch?", "Explain my allocation"]
                 cols = st.columns(len(suggestions))
                 for col, s in zip(cols, suggestions):
                     if col.button(s, key=s):
-                        st.session_state.messages.append({"role": "user", "content": s})
+                        st.session_state.messages.append({"role":"user","content":s})
                         st.rerun()
 
             if prompt := st.chat_input("Ask about your portfolio…"):
-                st.session_state.messages.append({"role": "user", "content": prompt})
+                st.session_state.messages.append({"role":"user","content":prompt})
                 with st.chat_message("user"):
                     st.markdown(prompt)
                 with st.chat_message("assistant"):
                     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
                     with st.spinner("Analyzing…"):
-                        response = client.messages.create(
-                            model="claude-sonnet-4-6",
-                            max_tokens=1024,
-                            system=system_prompt,
-                            messages=[{"role": m["role"], "content": m["content"]}
-                                      for m in st.session_state.messages],
-                        )
-                    reply = response.content[0].text
+                        resp = client.messages.create(
+                            model="claude-sonnet-4-6", max_tokens=1024,
+                            system=system,
+                            messages=[{"role":m["role"],"content":m["content"]}
+                                      for m in st.session_state.messages])
+                    reply = resp.content[0].text
                     st.markdown(reply)
-                    st.session_state.messages.append({"role": "assistant", "content": reply})
+                    st.session_state.messages.append({"role":"assistant","content":reply})

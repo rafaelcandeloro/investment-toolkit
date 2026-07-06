@@ -75,4 +75,31 @@ ETF_UNIVERSE = {
     ],
 }
 
-TICKERS = [ticker for group in ETF_UNIVERSE.values() for ticker in group]
+# Risk profile pools — which ETFs are eligible per risk level
+RISK_PROFILES = {
+    "Conservative": [
+        "BND","AGG","TLT","IEF","SHY","LQD","VTIP","HYG",  # bonds
+        "GLD","IAU","VNQ",                                   # real assets
+        "VTV","VONV","IWD","SCHV",                           # value
+        "XLP","XLU","XLV",                                   # defensive sectors
+        "VOO","VTI","ITOT",                                  # broad market anchor
+    ],
+    "Moderate": [
+        "VOO","VTI","VOOG","IWM","ITOT","SCHB",             # broad market
+        "VTV","IWD","SCHV","VOOV",                           # value
+        "QQQ","QQQM",                                        # growth (limited)
+        "XLF","XLI","XLC","XLV","XLE",                      # sectors
+        "EFA","VEA","IEMG",                                  # international
+        "BND","AGG","VTIP",                                  # bond anchor
+        "GLD",                                               # hedge
+    ],
+    "Aggressive": [
+        "QQQ","QQQM","VGT","XLK","SOXX","SMH","IGV","ARKK", # growth & tech
+        "BOTZ","AIQ","HACK","DRIV","ICLN","CARZ",            # thematic
+        "IWM","VOOG",                                        # growth-oriented broad
+        "XLC","XLY",                                         # high-beta sectors
+        "EEM","VWO","FXI",                                   # emerging markets
+    ],
+}
+
+TICKERS = [t for group in ETF_UNIVERSE.values() for t in group]
