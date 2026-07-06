@@ -669,86 +669,152 @@ with tabs[4]:
 # TAB 6 — AI ANALYST
 # ════════════════════════════════════════════════════════════════════════════════
 
+def build_portfolio_context():
+    lines = ["You are a professional portfolio analyst. Here is the current portfolio data:\n"]
+    lines.append("## ETF PORTFOLIO")
+    if not etf_alloc.empty:
+        for _, r in etf_alloc.iterrows():
+            lines.append(f"- {r['ticker']} ({r.get('category','')}) — "
+                         f"weight {r['wt_pct']:.1f}%, 1Y return {r['ret_1y']:+.1f}%, "
+                         f"Sharpe {r['sharpe']:.2f}, max drawdown {r['drawdown']:+.1f}%")
+    if not hf_alloc.empty:
+        lines.append("\n## HEDGE FUND MIRROR PORTFOLIO")
+        for _, r in hf_alloc.iterrows():
+            lines.append(f"- {r['ticker']} — weight {r['wt_pct']:.1f}%, "
+                         f"1Y return {r['ret_1y']:+.1f}%, Sharpe {r['sharpe']:.2f}, "
+                         f"held by {r.get('fund_count','?')} fund(s)")
+    lines.append(f"\n## METHODOLOGY")
+    lines.append(f"- Weighting: inverse-volatility (lower vol = higher weight)")
+    lines.append(f"- Correlation filter: pairs above {CORR_THRESHOLD} are removed")
+    lines.append(f"- Risk-free rate: {RISK_FREE*100:.1f}% (T-bill)")
+    lines.append(f"- 13F filings are delayed 45 days — disclosed positions, not current")
+    lines.append("\nAnswer clearly and concisely. Use professional language, explain jargon.")
+    return "\n".join(lines)
+
+
+def generate_quick_brief() -> str:
+    """Template-based portfolio brief — no API key needed."""
+    from datetime import date as dt
+    lines = []
+    lines.append(f"# Portfolio Morning Brief — {dt.today().strftime('%B %d, %Y')}\n")
+
+    if not etf_alloc.empty:
+        avg_ret    = etf_alloc["ret_1y"].mean()
+        avg_sharpe = etf_alloc["sharpe"].mean()
+        avg_dd     = etf_alloc["drawdown"].mean()
+        best       = etf_alloc.loc[etf_alloc["ret_1y"].idxmax()]
+        worst      = etf_alloc.loc[etf_alloc["ret_1y"].idxmin()]
+        top3       = etf_alloc.nlargest(3, "weight")["ticker"].tolist()
+        cat_wts    = etf_alloc.groupby("category")["wt_pct"].sum().sort_values(ascending=False)
+
+        lines.append("## ETF Portfolio")
+        lines.append(f"**Avg 1Y Return:** {avg_ret:+.1f}%  |  "
+                     f"**Avg Sharpe:** {avg_sharpe:.2f}  |  "
+                     f"**Avg Max Drawdown:** {avg_dd:+.1f}%\n")
+        lines.append(f"**Largest positions:** {', '.join(top3)}")
+        lines.append(f"**Best performer:** {best['ticker']} ({best['ret_1y']:+.1f}%, Sharpe {best['sharpe']:.2f})")
+        lines.append(f"**Worst performer:** {worst['ticker']} ({worst['ret_1y']:+.1f}%)\n")
+        lines.append("**Category breakdown:**")
+        for cat, wt in cat_wts.items():
+            lines.append(f"- {cat}: {wt:.1f}%")
+
+        sharpe_note = ("above the 1.0 benchmark — solid risk-adjusted return"
+                       if avg_sharpe >= 1.0 else
+                       "below the 1.0 benchmark — consider higher-momentum names or reducing low-return positions")
+        lines.append(f"\n**Sharpe assessment:** {avg_sharpe:.2f} is {sharpe_note}.")
+
+        if avg_dd < -15:
+            lines.append(f"**Drawdown note:** Average max drawdown of {avg_dd:.1f}% is elevated. "
+                         "Review positions with the largest drops for thesis changes.")
+
+    if not hf_alloc.empty:
+        lines.append("\n## Hedge Fund Mirror Portfolio")
+        top_hf = hf_alloc.nlargest(5, "weight")
+        lines.append(f"**Top 5 positions:** {', '.join(top_hf['ticker'].tolist())}")
+        lines.append(f"**Avg 1Y Return:** {hf_alloc['ret_1y'].mean():+.1f}%  |  "
+                     f"**Avg Sharpe:** {hf_alloc['sharpe'].mean():.2f}")
+        multi_fund = hf_alloc[hf_alloc.get("fund_count", pd.Series([0]*len(hf_alloc))) >= 2]
+        if not multi_fund.empty:
+            lines.append(f"**High conviction (2+ funds):** {', '.join(multi_fund['ticker'].tolist())}")
+
+    lines.append("\n## Key Reminders")
+    lines.append(f"- Correlation filter blocked pairs above {int(CORR_THRESHOLD*100)}% — remaining holdings are genuinely diversified")
+    lines.append("- 13F filings lag reality by 45 days — hedge fund tab shows disclosed, not current, positions")
+    lines.append(f"- Risk-free rate: {RISK_FREE*100:.1f}% — any Sharpe below 1.0 means you're not being fully compensated for risk")
+
+    return "\n".join(lines)
+
+
 with tabs[5]:
     st.title("AI Portfolio Analyst")
-    st.caption("Ask anything about your portfolios. Powered by Claude.")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        st.warning("Enter your Anthropic API key in the sidebar to use the AI Analyst.")
+    analyst_mode = st.radio(
+        "Mode",
+        ["Quick Brief (free, no API key)", "Claude AI Chat (requires API key)"],
+        horizontal=True
+    )
+
+    st.divider()
+
+    if analyst_mode == "Quick Brief (free, no API key)":
+        st.caption("Generates a structured portfolio brief from your live data. No API key needed.")
+        if st.button("Generate Morning Brief", type="primary"):
+            with st.spinner("Analyzing your portfolio..."):
+                brief = generate_quick_brief()
+            st.markdown(brief)
+            st.divider()
+            st.caption("For conversational Q&A and deeper analysis, switch to Claude AI Chat mode and add an API key.")
+
     else:
-        try:
-            import anthropic
-        except ImportError:
-            st.error("Run: pip3 install anthropic")
-            st.stop()
+        st.caption("Conversational analyst powered by Claude. Enter your Anthropic API key in the sidebar.")
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            st.warning("Enter your Anthropic API key in the sidebar to enable AI chat.")
+            st.info("Get one at console.anthropic.com → API Keys. $5 in credits lasts months of personal use.")
+        else:
+            try:
+                import anthropic
+            except ImportError:
+                st.error("Run: pip3 install anthropic")
+                st.stop()
 
-        # Build portfolio context for the AI
-        def build_context():
-            lines = ["You are a professional portfolio analyst. Here is the current portfolio data:\n"]
+            system_prompt = build_portfolio_context()
 
-            lines.append("## ETF PORTFOLIO")
-            if not etf_alloc.empty:
-                for _, r in etf_alloc.iterrows():
-                    lines.append(f"- {r['ticker']} ({r.get('category','')}) — "
-                                 f"weight {r['wt_pct']:.1f}%, 1Y return {r['ret_1y']:+.1f}%, "
-                                 f"Sharpe {r['sharpe']:.2f}, max drawdown {r['drawdown']:+.1f}%")
+            if "messages" not in st.session_state:
+                st.session_state.messages = []
 
-            lines.append("\n## HEDGE FUND MIRROR PORTFOLIO")
-            if not hf_alloc.empty:
-                for _, r in hf_alloc.iterrows():
-                    lines.append(f"- {r['ticker']} — weight {r['wt_pct']:.1f}%, "
-                                 f"1Y return {r['ret_1y']:+.1f}%, Sharpe {r['sharpe']:.2f}, "
-                                 f"held by {r.get('fund_count', '?')} fund(s): {r.get('funds','')}")
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
 
-            lines.append(f"\n## KEY METRICS")
-            lines.append(f"- Risk-free rate used: {RISK_FREE*100:.1f}%")
-            lines.append(f"- Correlation filter threshold: {CORR_THRESHOLD}")
-            lines.append(f"- Weighting method: inverse-volatility (lower vol = higher weight)")
-            lines.append(f"- 13F data note: filings are delayed 45 days, filed quarterly")
-            lines.append("\nAnswer questions clearly and concisely. Use professional language but explain jargon.")
-            return "\n".join(lines)
+            if not st.session_state.messages:
+                st.markdown("**Try asking:**")
+                suggestions = [
+                    "Give me a morning brief on my ETF portfolio",
+                    "Which portfolio has the best risk-adjusted return and why?",
+                    "Are my portfolios actually diversified or just correlated bets?",
+                    "What macro factors should I be watching given these holdings?",
+                    "Explain inverse-volatility weighting in plain English",
+                ]
+                cols = st.columns(len(suggestions))
+                for col, s in zip(cols, suggestions):
+                    if col.button(s, key=s):
+                        st.session_state.messages.append({"role": "user", "content": s})
+                        st.rerun()
 
-        system_prompt = build_context()
-
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-
-        # Display history
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        # Suggested prompts
-        if not st.session_state.messages:
-            st.markdown("**Try asking:**")
-            suggestions = [
-                "Give me a morning brief on my ETF portfolio",
-                "Which portfolio has the best risk-adjusted return and why?",
-                "Are my portfolios actually diversified or just correlated bets?",
-                "What macro factors should I be watching given these holdings?",
-                "Explain inverse-volatility weighting in plain English",
-            ]
-            cols = st.columns(len(suggestions))
-            for col, s in zip(cols, suggestions):
-                if col.button(s, key=s):
-                    st.session_state.messages.append({"role": "user", "content": s})
-                    st.rerun()
-
-        if prompt := st.chat_input("Ask about your portfolio…"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            with st.chat_message("assistant"):
-                client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-                with st.spinner("Analyzing…"):
-                    response = client.messages.create(
-                        model="claude-sonnet-4-6",
-                        max_tokens=1024,
-                        system=system_prompt,
-                        messages=[{"role": m["role"], "content": m["content"]}
-                                  for m in st.session_state.messages],
-                    )
-                reply = response.content[0].text
-                st.markdown(reply)
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+            if prompt := st.chat_input("Ask about your portfolio…"):
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                with st.chat_message("assistant"):
+                    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+                    with st.spinner("Analyzing…"):
+                        response = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=1024,
+                            system=system_prompt,
+                            messages=[{"role": m["role"], "content": m["content"]}
+                                      for m in st.session_state.messages],
+                        )
+                    reply = response.content[0].text
+                    st.markdown(reply)
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
