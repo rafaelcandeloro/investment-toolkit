@@ -478,7 +478,12 @@ with tabs[2]:
     st.info("⚠️ 13F filings are delayed 45 days and filed quarterly. These are disclosed positions, not current ones.", icon="ℹ️")
 
     if hf_alloc.empty:
-        st.warning("Could not load 13F data. SEC EDGAR may be rate-limiting — try again in a minute.")
+        st.warning("Could not load 13F data from SEC EDGAR.")
+        st.info("SEC EDGAR rate-limits requests. This usually resolves in 1-2 minutes. Click **Refresh market data** in the sidebar or reload the page.")
+        if st.button("🔄 Retry hedge fund data"):
+            get_aggregate_holdings.clear()
+            build_hf_portfolio.clear()
+            st.rerun()
     else:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Positions",        len(hf_alloc))
@@ -589,22 +594,16 @@ with tabs[4]:
     history = load_paper_history()
 
     if history.empty:
-        st.info("No paper trading history yet. Click the button above to start tracking.")
+        st.info("No paper trading history yet. Click **▶ Start / Update** above to begin tracking.")
     else:
-        # Fetch SPY for benchmark
-        spy_raw = yf.download("SPY", start=history["snap_date"].min(), progress=False, auto_adjust=True)
-        spy_raw = spy_raw.reset_index()
-        spy_raw.columns = [c[0] if isinstance(c, tuple) else c for c in spy_raw.columns]
-
-        start_spy  = spy_raw["Close"].iloc[0]
-        spy_raw["SPY"] = (spy_raw["Close"] / start_spy) * 100
-
         fig = go.Figure()
         colors = {"ETF Strategy": "#60a5fa", "Hedge Fund Mirror": "#34d399", "Mixed Strategy": "#f472b6"}
 
         for port_name in history["portfolio"].unique():
             sub = history[history["portfolio"] == port_name].copy()
             sub["snap_date"] = pd.to_datetime(sub["snap_date"])
+            if sub.empty or sub["value"].iloc[0] == 0:
+                continue
             start_val = sub["value"].iloc[0]
             sub["indexed"] = (sub["value"] / start_val) * 100
             fig.add_trace(go.Scatter(
@@ -612,13 +611,26 @@ with tabs[4]:
                 name=port_name, line=dict(width=2, color=colors.get(port_name, "white"))
             ))
 
-        fig.add_trace(go.Scatter(
-            x=pd.to_datetime(spy_raw["Date"]), y=spy_raw["SPY"],
-            name="S&P 500 (SPY)", line=dict(width=2, dash="dash", color="#94a3b8")
-        ))
+        # SPY benchmark — only add if we have at least 2 snapshots
+        if len(history["snap_date"].unique()) >= 2:
+            try:
+                start_date = pd.to_datetime(history["snap_date"].min()).strftime("%Y-%m-%d")
+                spy_raw = yf.download("SPY", start=start_date, progress=False, auto_adjust=True)
+                if not spy_raw.empty:
+                    spy_raw = spy_raw.reset_index()
+                    spy_raw.columns = [c[0] if isinstance(c, tuple) else c for c in spy_raw.columns]
+                    start_spy = spy_raw["Close"].iloc[0]
+                    spy_raw["SPY"] = (spy_raw["Close"] / start_spy) * 100
+                    fig.add_trace(go.Scatter(
+                        x=pd.to_datetime(spy_raw["Date"]), y=spy_raw["SPY"],
+                        name="S&P 500 (SPY)", line=dict(width=2, dash="dash", color="#94a3b8")
+                    ))
+            except Exception:
+                pass
+
         fig.update_layout(
             title="Portfolio Performance vs S&P 500 (indexed to 100)",
-            yaxis_title="Value (indexed)", xaxis_title="Date",
+            yaxis_title="Value (indexed to 100)", xaxis_title="Date",
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
             height=450
         )
